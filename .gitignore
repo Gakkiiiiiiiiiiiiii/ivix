@@ -1,0 +1,8 @@
+.venv/
+.venvsp/
+.tmp/
+__pycache__/
+.idea/
+akshare-main/
+akshare-main.zip
+*.pyc

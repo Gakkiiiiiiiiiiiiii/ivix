@@ -1,24 +1,71 @@
 from __future__ import annotations
 
+import csv
+import io
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+import urllib.request
 
 import numpy as np
 import pandas as pd
 from scipy import interpolate
 
+from sina_option_board import fetch_sse_option_board
+
 
 OPTION_COLUMNS = ["SEC_NAME", "EXE_MODE", "EXE_PRICE", "EXE_ENDDATE", "CLOSE"]
 CHINESE_CALL = "认购"
 CHINESE_PUT = "认沽"
+QVIX_50ETF_DAILY_URL = "http://1.optbbs.com/d/csv/d/k.csv"
+QVIX_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "http://1.optbbs.com/s/vix.shtml?50ETF",
+    "Connection": "close",
+}
 
 
 @dataclass
 class IvixDataBundle:
     options: pd.DataFrame
     shibor: pd.DataFrame
+
+
+def load_saved_ivix_history(
+    output_path: str = "./ivix.csv",
+    tradeday_path: str = "./tradeday.csv",
+) -> pd.DataFrame:
+    output_file = Path(output_path)
+    if not output_file.exists():
+        return pd.DataFrame(columns=["DateTime", "value"])
+
+    history = pd.read_csv(output_file)
+    if "DateTime" not in history.columns:
+        history["DateTime"] = pd.NA
+    if "value" not in history.columns:
+        history["value"] = np.nan
+
+    date_series = history["DateTime"].copy()
+    missing_mask = date_series.isna() | (date_series.astype(str).str.strip() == "")
+    missing_count = int(missing_mask.sum())
+    if missing_count:
+        tradeday_df = pd.read_csv(tradeday_path)
+        tradedays = tradeday_df["DateTime"].astype(str).tolist()
+        if missing_count > len(tradedays):
+            raise ValueError("tradeday.csv does not contain enough dates to align ivix.csv")
+        date_series.loc[missing_mask] = tradedays[:missing_count]
+
+    parsed_dates = pd.to_datetime(date_series, format="%Y/%m/%d", errors="coerce")
+    result = pd.DataFrame(
+        {
+            "DateTime": parsed_dates,
+            "value": pd.to_numeric(history["value"], errors="coerce"),
+        }
+    ).dropna()
+    result = result.sort_values("DateTime").drop_duplicates(subset=["DateTime"], keep="last").reset_index(drop=True)
+    result["DateTime"] = result["DateTime"].dt.strftime("%Y/%m/%d")
+    return result
 
 
 def load_local_data(
@@ -206,9 +253,53 @@ def _normalize_board_to_option_rows(board: pd.DataFrame, trade_date: str, end_mo
     return options.set_index("trade_date")[OPTION_COLUMNS]
 
 
-def fetch_latest_option_data(trade_date: str, months_ahead: int = 4) -> pd.DataFrame:
-    import akshare as ak
+def fetch_qvix_50etf_history(url: str = QVIX_50ETF_DAILY_URL) -> pd.DataFrame:
+    request = urllib.request.Request(url, headers=QVIX_REQUEST_HEADERS)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        text = response.read().decode("utf-8-sig", errors="replace")
 
+    rows: List[dict] = []
+    for index, row in enumerate(csv.reader(io.StringIO(text))):
+        if index == 0 or len(row) <= 4:
+            continue
+        date_text = row[0].strip()
+        close_text = row[4].strip()
+        if not date_text or not close_text or close_text.startswith("#"):
+            continue
+        rows.append(
+            {
+                "DateTime": pd.to_datetime(date_text, format="%Y/%m/%d", errors="coerce"),
+                "value": pd.to_numeric(close_text, errors="coerce"),
+            }
+        )
+
+    history = pd.DataFrame(rows).dropna()
+    if history.empty:
+        raise RuntimeError("QVIX 50ETF 历史数据为空")
+
+    history = history.sort_values("DateTime").drop_duplicates(subset=["DateTime"], keep="last").reset_index(drop=True)
+    history["DateTime"] = history["DateTime"].dt.strftime("%Y/%m/%d")
+    return history
+
+
+def backfill_ivix_history(
+    output_path: str = "./ivix.csv",
+    tradeday_path: str = "./tradeday.csv",
+) -> pd.DataFrame:
+    existing_history = load_saved_ivix_history(output_path=output_path, tradeday_path=tradeday_path)
+    qvix_history = fetch_qvix_50etf_history()
+
+    # Prefer locally computed legacy values when the same date exists in both sources.
+    merged_history = pd.concat([qvix_history, existing_history], ignore_index=True)
+    merged_history["value"] = pd.to_numeric(merged_history["value"], errors="coerce")
+    merged_history = merged_history.dropna(subset=["DateTime", "value"])
+    merged_history = merged_history.sort_values("DateTime").drop_duplicates(subset=["DateTime"], keep="last")
+    merged_history = merged_history.reset_index(drop=True)
+    merged_history.to_csv(output_path, index=False)
+    return merged_history
+
+
+def fetch_latest_option_data(trade_date: str, months_ahead: int = 4) -> pd.DataFrame:
     day = _parse_trade_date(trade_date)
     month_codes = []
     for i in range(months_ahead):
@@ -219,7 +310,7 @@ def fetch_latest_option_data(trade_date: str, months_ahead: int = 4) -> pd.DataF
     collected = []
     for month_code in month_codes:
         try:
-            board = ak.option_finance_board(symbol="华夏上证50ETF期权", end_month=month_code)
+            board = fetch_sse_option_board(month_code=month_code)
         except Exception:
             continue
         if board is None or board.empty:
@@ -236,10 +327,11 @@ def refresh_latest_ivix(
     output_path: str = "./ivix.csv",
     options_path: str = "./options.csv",
     shibor_path: str = "./shibor.csv",
+    tradeday_path: str = "./tradeday.csv",
 ) -> Tuple[str, float]:
     bundle = load_local_data(options_path=options_path, shibor_path=shibor_path)
 
-    # 以当前系统日期作为默认交易日。若非交易日，AKShare返回空会触发异常。
+    # 以当前系统日期作为默认交易日。若非交易日，最新期权月合约抓取会触发异常。
     latest_trade_date = datetime.now().strftime("%Y/%m/%d")
     latest_options = fetch_latest_option_data(latest_trade_date)
 
@@ -250,17 +342,7 @@ def refresh_latest_ivix(
 
     latest_ivix = cal_day_ivix(latest_trade_date, all_options, bundle.shibor)
 
-    output_file = Path(output_path)
-    if output_file.exists():
-        history = pd.read_csv(output_file)
-    else:
-        history = pd.DataFrame(columns=["DateTime", "value"])
-
-    if "DateTime" not in history.columns:
-        history["DateTime"] = ""
-    if "value" not in history.columns:
-        history["value"] = np.nan
-
+    history = load_saved_ivix_history(output_path=output_path, tradeday_path=tradeday_path)
     history = history[history["DateTime"] != latest_trade_date]
     history = pd.concat(
         [history, pd.DataFrame([{"DateTime": latest_trade_date, "value": latest_ivix}])],
@@ -270,6 +352,26 @@ def refresh_latest_ivix(
     return latest_trade_date, latest_ivix
 
 
+def sync_and_refresh_ivix(
+    output_path: str = "./ivix.csv",
+    options_path: str = "./options.csv",
+    shibor_path: str = "./shibor.csv",
+    tradeday_path: str = "./tradeday.csv",
+) -> Tuple[str, float]:
+    try:
+        history = backfill_ivix_history(output_path=output_path, tradeday_path=tradeday_path)
+        print(f"backfilled ivix history rows={len(history)}")
+    except Exception as exc:
+        print(f"warning: failed to backfill ivix history: {exc}")
+
+    return refresh_latest_ivix(
+        output_path=output_path,
+        options_path=options_path,
+        shibor_path=shibor_path,
+        tradeday_path=tradeday_path,
+    )
+
+
 if __name__ == "__main__":
-    date_text, ivix_value = refresh_latest_ivix()
+    date_text, ivix_value = sync_and_refresh_ivix()
     print(f"latest ivix({date_text})={ivix_value:.4f}")

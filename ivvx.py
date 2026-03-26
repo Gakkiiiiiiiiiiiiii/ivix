@@ -1,202 +1,275 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from scipy import interpolate
-from pyecharts.charts import Line
-
-shibor_rate = pd.read_csv('./shibor.csv', index_col=0, encoding='GBK')
-options_data = pd.read_csv('./options.csv', index_col=0, encoding='GBK')
-tradeday = pd.read_csv('./tradeday.csv', encoding='GBK')
-true_ivix = pd.read_csv('./ivixx.csv', encoding='GBK')
 
 
-# ==============================================================================
-# 开始计算ivix部分
-# ==============================================================================
-def periodsSplineRiskFreeInterestRate(options, date):
-    """
-    params: options: 计算VIX的当天的options数据用来获取expDate
-            date: 计算哪天的VIX
-    return：shibor：该date到每个到期日exoDate的risk free rate
+OPTION_COLUMNS = ["SEC_NAME", "EXE_MODE", "EXE_PRICE", "EXE_ENDDATE", "CLOSE"]
+CHINESE_CALL = "认购"
+CHINESE_PUT = "认沽"
 
-    """
-    date = datetime.strptime(date, '%Y/%m/%d')
-    # date = datetime(date.year,date.month,date.day)
+
+@dataclass
+class IvixDataBundle:
+    options: pd.DataFrame
+    shibor: pd.DataFrame
+
+
+def load_local_data(
+    options_path: str = "./options.csv",
+    shibor_path: str = "./shibor.csv",
+) -> IvixDataBundle:
+    options = pd.read_csv(options_path, index_col=0, encoding="GBK")
+    options.index.name = "trade_date"
+    shibor = pd.read_csv(shibor_path, index_col=0, encoding="GBK")
+    return IvixDataBundle(options=options, shibor=shibor)
+
+
+def _parse_trade_date(date_text: str) -> datetime:
+    return datetime.strptime(date_text, "%Y/%m/%d")
+
+
+def periods_spline_risk_free_interest_rate(options: pd.DataFrame, date: str, shibor_rate: pd.DataFrame) -> Dict[datetime, float]:
+    date_dt = _parse_trade_date(date)
     exp_dates = np.sort(options.EXE_ENDDATE.unique())
-    periods = {}
-    for epd in exp_dates:
-        epd = pd.to_datetime(epd)
-        periods[epd] = (epd - date).days * 1.0 / 365.0
-    shibor_date = datetime.strptime(shibor_rate.index[0], "%Y-%m-%d")
-    if date >= shibor_date:
-        date_str = shibor_rate.index[0]
-        shibor_values = shibor_rate.ix[0].values
-        # shibor_values = np.asarray(list(map(float,shibor_values)))
-    else:
-        date_str = date.strftime("%Y-%m-%d")
-        shibor_values = shibor_rate.loc[date_str].values
-        # shibor_values = np.asarray(list(map(float,shibor_values)))
 
+    periods = {}
+    for exp_date in exp_dates:
+        exp_dt = pd.to_datetime(exp_date)
+        periods[exp_dt] = (exp_dt - date_dt).days / 365.0
+
+    latest_shibor_dt = datetime.strptime(shibor_rate.index[0], "%Y-%m-%d")
+    if date_dt >= latest_shibor_dt:
+        shibor_values = shibor_rate.iloc[0].values
+    else:
+        shibor_values = shibor_rate.loc[date_dt.strftime("%Y-%m-%d")].values
+
+    period_nodes = np.asarray([1.0, 7.0, 14.0, 30.0, 90.0, 180.0, 270.0, 360.0]) / 360.0
+    min_period = float(np.min(period_nodes))
+    max_period = float(np.max(period_nodes))
+
+    linear_interpolator = interpolate.interp1d(period_nodes, shibor_values)
     shibor = {}
-    period = np.asarray([1.0, 7.0, 14.0, 30.0, 90.0, 180.0, 270.0, 360.0]) / 360.0
-    min_period = min(period)
-    max_period = max(period)
-    for p in periods.keys():
-        tmp = periods[p]
-        if periods[p] > max_period:
-            tmp = max_period * 0.99999
-        elif periods[p] < min_period:
-            tmp = min_period * 1.00001
-        # 此处使用SHIBOR来插值
-        linear_interpolator = interpolate.interp1d(period, shibor_values)
-        sh = linear_interpolator(tmp)
-        shibor[p] = sh / 100.0
+    for exp_dt, time_to_expire in periods.items():
+        clipped = min(max(time_to_expire, min_period * 1.00001), max_period * 0.99999)
+        shibor[exp_dt] = float(linear_interpolator(clipped)) / 100.0
     return shibor
 
 
-def getHistDayOptions(vixDate, options_data):
-    options_data = options_data.loc[vixDate, :]
-    return options_data
+def get_hist_day_options(vix_date: str, options_data: pd.DataFrame) -> pd.DataFrame:
+    return options_data.loc[vix_date, :]
 
 
-def getNearNextOptExpDate(options, vixDate):
-    # 找到options中的当月和次月期权到期日；
-    # 用这两个期权隐含的未来波动率来插值计算未来30隐含波动率，是为市场恐慌指数VIX；
-    # 如果options中的最近到期期权离到期日仅剩1天以内，则抛弃这一期权，改
-    # 选择次月期权和次月期权之后第一个到期的期权来计算。
-    # 返回的near和next就是用来计算VIX的两个期权的到期日
-    """
-    params: options: 该date为交易日的所有期权合约的基本信息和价格信息
-            vixDate: VIX的计算日期
-    return: near: 当月合约到期日（ps：大于1天到期）
-            next：次月合约到期日
-    """
-    vixDate = datetime.strptime(vixDate, '%Y/%m/%d')
-    optionsExpDate = list(pd.Series(options.EXE_ENDDATE.values.ravel()).unique())
-    optionsExpDate = [datetime.strptime(i, '%Y/%m/%d %H:%M') for i in optionsExpDate]
-    near = min(optionsExpDate)
-    optionsExpDate.remove(near)
-    if near.day - vixDate.day < 1:
-        near = min(optionsExpDate)
-        optionsExpDate.remove(near)
-    nt = min(optionsExpDate)
-    return near, nt
+def get_near_next_opt_exp_date(options: pd.DataFrame, vix_date: str) -> Tuple[datetime, datetime]:
+    vix_dt = _parse_trade_date(vix_date)
+    exp_dates = list(pd.Series(options.EXE_ENDDATE.values.ravel()).unique())
+    exp_dates = [datetime.strptime(i, "%Y/%m/%d %H:%M") for i in exp_dates]
+
+    near = min(exp_dates)
+    exp_dates.remove(near)
+    if (near - vix_dt).days < 1:
+        near = min(exp_dates)
+        exp_dates.remove(near)
+    next_exp = min(exp_dates)
+    return near, next_exp
 
 
-def getStrikeMinCallMinusPutClosePrice(options):
-    # options 中包括计算某日VIX的call和put两种期权，
-    # 对每个行权价，计算相应的call和put的价格差的绝对值，
-    # 返回这一价格差的绝对值最小的那个行权价，
-    # 并返回该行权价对应的call和put期权价格的差
-    """
-    params:options: 该date为交易日的所有期权合约的基本信息和价格信息
-    return: strike: 看涨合约价格-看跌合约价格 的差值的绝对值最小的行权价
-            priceDiff: 以及这个差值，这个是用来确定中间行权价的第一步
-    """
-    call = options[options.EXE_MODE == u"认购"].set_index(u"EXE_PRICE").sort_index()
-    put = options[options.EXE_MODE == u"认沽"].set_index(u"EXE_PRICE").sort_index()
-    callMinusPut = call.CLOSE - put.CLOSE
-    strike = abs(callMinusPut).idxmin()
-    priceDiff = callMinusPut[strike].min()
-    return strike, priceDiff
+def cal_sigma_square(options: pd.DataFrame, risk_free_rate: float, time_to_expire: float) -> float:
+    call_all = options[options.EXE_MODE == CHINESE_CALL].set_index("EXE_PRICE").sort_index()
+    put_all = options[options.EXE_MODE == CHINESE_PUT].set_index("EXE_PRICE").sort_index()
 
+    columns_to_drop = ["SEC_NAME", "EXE_ENDDATE", "EXE_MODE"]
+    call_all = call_all.drop(columns=columns_to_drop, axis=1, inplace=False)
+    put_all = put_all.drop(columns=columns_to_drop, axis=1, inplace=False)
 
-def calSigmaSquare(options, R, T):
-    # 计算某个到期日期权对于VIX的贡献sigma；
-    # 输入为期权数据options，FF为forward index price，
-    # R为无风险利率， T为期权剩余到期时间
-    """
-    params: options:该date为交易日的所有期权合约的基本信息和价格信息
-            R： 这部分期权合约到期日对应的无风险利率 shibor
-            T： 还有多久到期（年化）
-    return：Sigma：得到的结果是传入该到期日数据的Sigma
-    """
-    callAll = options[options.EXE_MODE == u"认购"].set_index(u"EXE_PRICE").sort_index()
-    putAll = options[options.EXE_MODE == u"认沽"].set_index(u"EXE_PRICE").sort_index()
-    columns_to_drop = ['SEC_NAME', 'EXE_ENDDATE', 'EXE_MODE']
-    callAll = callAll.drop(columns=columns_to_drop, axis=1, inplace=False)
-    putAll = putAll.drop(columns=columns_to_drop, axis=1, inplace=False)
-    callAll = callAll.groupby(level=0).agg({'CLOSE': 'min'})
-    putAll = putAll.groupby(level=0).agg({'CLOSE': 'max'})
-    # strike call put price gap detaK sigma
-    option = callAll.merge(putAll, on="EXE_PRICE", how="inner")
-    column_name = {
-        'EXE_PRICE': 'strike',
-        'CLOSE_x': 'call',
-        'CLOSE_y': 'put',
-    }
-    option = option.rename(columns=column_name)
-    option['gap'] = abs(option['call'] - option['put'])
+    call_all = call_all.groupby(level=0).agg({"CLOSE": "min"})
+    put_all = put_all.groupby(level=0).agg({"CLOSE": "max"})
 
-    f_idx = option['gap'].idxmin()
-    F = f_idx + np.exp(T*R) * option.loc[f_idx, 'gap']
-    option['price'] = np.where(option.index < f_idx, option['put'], np.where(option.index == f_idx, (option['put'] + option['call'])/2, option['call']))
+    option = call_all.merge(put_all, on="EXE_PRICE", how="inner").rename(
+        columns={"CLOSE_x": "call", "CLOSE_y": "put"}
+    )
+    option["gap"] = abs(option["call"] - option["put"])
+
+    f_idx = option["gap"].idxmin()
+    forward_price = f_idx + np.exp(time_to_expire * risk_free_rate) * option.loc[f_idx, "gap"]
+
+    option["price"] = np.where(
+        option.index < f_idx,
+        option["put"],
+        np.where(option.index == f_idx, (option["put"] + option["call"]) / 2, option["call"]),
+    )
 
     idx = option.index
-    option.loc[idx[0], 'deltaK'] = option.index[1] - option.index[0]
+    option.loc[idx[0], "deltaK"] = option.index[1] - option.index[0]
     for i in range(1, len(option) - 1):
-        option.loc[idx[i], 'deltaK'] = (option.index[i + 1] - option.index[i-1]) / 2
-    option.loc[idx[-1], 'deltaK'] = option.index[-1] - option.index[-2]
+        option.loc[idx[i], "deltaK"] = (option.index[i + 1] - option.index[i - 1]) / 2
+    option.loc[idx[-1], "deltaK"] = option.index[-1] - option.index[-2]
 
-    option['sigma'] = (option['deltaK']/option.index**2) * np.exp(R*T)*option['price']
-    sigma = option['sigma'].sum()*2/T - (F/f_idx - 1)**2/T
-    return sigma
-
-
-def changeste(t):
-    if t.month >= 10:
-        str_t = t.strftime('%Y/%m/%d ') + '0:00'
-    else:
-        str_t = t.strftime('%Y/%m/%d ')
-        str_t = str_t[:5] + str_t[6:] + '0:00'
-    return str_t
+    option["sigma"] = (option["deltaK"] / (option.index**2)) * np.exp(risk_free_rate * time_to_expire) * option["price"]
+    sigma = option["sigma"].sum() * 2 / time_to_expire - ((forward_price / f_idx - 1) ** 2) / time_to_expire
+    return float(sigma)
 
 
-def calDayVIX(vixDate):
-    # 利用CBOE的计算方法，计算历史某一日的未来30日期权波动率指数VIX
-    """
-    params：vixDate：计算VIX的日期  '%Y/%m/%d' 字符串格式
-    return：VIX结果
-    """
+def _format_expiry(expiry_dt: datetime) -> str:
+    month = f"{expiry_dt.month:02d}"
+    return f"{expiry_dt.year}/{month}/{expiry_dt.day} 0:00"
 
-    # 拿取所需期权信息
-    options = getHistDayOptions(vixDate, options_data)
-    near, nexts = getNearNextOptExpDate(options, vixDate)
-    shibor = periodsSplineRiskFreeInterestRate(options, vixDate)
-    R_near = shibor[datetime(near.year, near.month, near.day)]
-    R_next = shibor[datetime(nexts.year, nexts.month, nexts.day)]
 
-    str_near = changeste(near)
-    str_nexts = changeste(nexts)
-    optionsNearTerm = options[options.EXE_ENDDATE == str_near]
-    optionsNextTerm = options[options.EXE_ENDDATE == str_nexts]
-    # time to expiration
-    vixDate = datetime.strptime(vixDate, '%Y/%m/%d')
-    T_near = (near - vixDate).days / 365.0
-    T_next = (nexts - vixDate).days / 365.0
+def cal_day_ivix(vix_date: str, options_data: pd.DataFrame, shibor_rate: pd.DataFrame) -> float:
+    options = get_hist_day_options(vix_date, options_data)
+    near_exp, next_exp = get_near_next_opt_exp_date(options, vix_date)
 
-    # 计算不同到期日期权对于VIX的贡献
-    near_sigma = calSigmaSquare(optionsNearTerm, R_near, T_near)
-    next_sigma = calSigmaSquare(optionsNextTerm, R_next, T_next)
+    shibor = periods_spline_risk_free_interest_rate(options, vix_date, shibor_rate)
+    r_near = shibor[datetime(near_exp.year, near_exp.month, near_exp.day)]
+    r_next = shibor[datetime(next_exp.year, next_exp.month, next_exp.day)]
 
-    # 利用两个不同到期日的期权对VIX的贡献sig1和sig2，
-    # 已经相应的期权剩余到期时间T1和T2；
-    # 差值得到并返回VIX指数(%)
-    w = (T_next - 30.0 / 365.0) / (T_next - T_near)
-    vix = T_near * w * near_sigma + T_next * (1 - w) * next_sigma
+    options_near = options[options.EXE_ENDDATE == _format_expiry(near_exp)]
+    options_next = options[options.EXE_ENDDATE == _format_expiry(next_exp)]
+
+    vix_dt = _parse_trade_date(vix_date)
+    t_near = (near_exp - vix_dt).days / 365.0
+    t_next = (next_exp - vix_dt).days / 365.0
+
+    near_sigma = cal_sigma_square(options_near, r_near, t_near)
+    next_sigma = cal_sigma_square(options_next, r_next, t_next)
+
+    weight = (t_next - 30.0 / 365.0) / (t_next - t_near)
+    vix = t_near * weight * near_sigma + t_next * (1 - weight) * next_sigma
     return 100 * np.sqrt(abs(vix) * 365.0 / 30.0)
 
 
-ivix = []
-for day in tradeday['DateTime']:
-    ivix.append(calDayVIX(day))
-    # print ivix
-vix_df = pd.DataFrame(ivix, columns=['value'])
-vix_df.to_csv('./ivix.csv', index=False)
+def _infer_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
 
-attr = true_ivix[u'日期'].tolist()
-line = Line()
-line.add_xaxis(attr)
-line.add_yaxis("中证指数发布", true_ivix[u'收盘价(元)'].tolist())
-line.add_yaxis("手动计算", ivix)
-line.render('./vix.html')
+
+def _normalize_board_to_option_rows(board: pd.DataFrame, trade_date: str, end_month: str) -> pd.DataFrame:
+    strike_col = _infer_column(board, ["行权价", "执行价", "执行价格", "EXE_PRICE"])
+    if strike_col is None:
+        raise ValueError("无法识别期权行权价列")
+
+    call_name_col = _infer_column(board, ["看涨合约-名称", "认购合约名称", "认购合约", "call_name"])
+    put_name_col = _infer_column(board, ["看跌合约-名称", "认沽合约名称", "认沽合约", "put_name"])
+
+    call_price_col = _infer_column(board, ["看涨合约-最新价", "认购最新价", "看涨最新价", "call_latest"])
+    put_price_col = _infer_column(board, ["看跌合约-最新价", "认沽最新价", "看跌最新价", "put_latest"])
+    if call_price_col is None or put_price_col is None:
+        raise ValueError("无法识别期权最新价列")
+
+    expiry_col = _infer_column(board, ["到期日", "到期日期", "expiry_date"])
+    if expiry_col is not None:
+        expiry_value = pd.to_datetime(board.iloc[0][expiry_col])
+    else:
+        expiry_value = datetime.strptime("20" + end_month + "25", "%Y%m%d")
+    expiry_text = _format_expiry(expiry_value)
+
+    rows: List[dict] = []
+    for _, row in board.iterrows():
+        strike = float(row[strike_col])
+        call_name = row[call_name_col] if call_name_col else f"50ETF购{end_month}{strike}"
+        put_name = row[put_name_col] if put_name_col else f"50ETF沽{end_month}{strike}"
+
+        call_price = row[call_price_col]
+        put_price = row[put_price_col]
+        if pd.notna(call_price):
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "SEC_NAME": call_name,
+                    "EXE_MODE": CHINESE_CALL,
+                    "EXE_PRICE": strike,
+                    "EXE_ENDDATE": expiry_text,
+                    "CLOSE": float(call_price),
+                }
+            )
+        if pd.notna(put_price):
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "SEC_NAME": put_name,
+                    "EXE_MODE": CHINESE_PUT,
+                    "EXE_PRICE": strike,
+                    "EXE_ENDDATE": expiry_text,
+                    "CLOSE": float(put_price),
+                }
+            )
+
+    options = pd.DataFrame(rows)
+    return options.set_index("trade_date")[OPTION_COLUMNS]
+
+
+def fetch_latest_option_data(trade_date: str, months_ahead: int = 4) -> pd.DataFrame:
+    import akshare as ak
+
+    day = _parse_trade_date(trade_date)
+    month_codes = []
+    for i in range(months_ahead):
+        y = day.year + (day.month - 1 + i) // 12
+        m = (day.month - 1 + i) % 12 + 1
+        month_codes.append(f"{str(y)[-2:]}{m:02d}")
+
+    collected = []
+    for month_code in month_codes:
+        try:
+            board = ak.option_finance_board(symbol="华夏上证50ETF期权", end_month=month_code)
+        except Exception:
+            continue
+        if board is None or board.empty:
+            continue
+        normalized = _normalize_board_to_option_rows(board, trade_date=trade_date, end_month=month_code)
+        collected.append(normalized)
+
+    if len(collected) < 2:
+        raise RuntimeError("获取到的期权月合约不足，至少需要近月与次近月两组数据")
+    return pd.concat(collected).sort_values(["EXE_ENDDATE", "EXE_PRICE", "EXE_MODE"])
+
+
+def refresh_latest_ivix(
+    output_path: str = "./ivix.csv",
+    options_path: str = "./options.csv",
+    shibor_path: str = "./shibor.csv",
+) -> Tuple[str, float]:
+    bundle = load_local_data(options_path=options_path, shibor_path=shibor_path)
+
+    # 以当前系统日期作为默认交易日。若非交易日，AKShare返回空会触发异常。
+    latest_trade_date = datetime.now().strftime("%Y/%m/%d")
+    latest_options = fetch_latest_option_data(latest_trade_date)
+
+    all_options = pd.concat([bundle.options, latest_options]).reset_index().drop_duplicates(
+        subset=["trade_date", "SEC_NAME", "EXE_MODE", "EXE_PRICE", "EXE_ENDDATE"],
+        keep="last",
+    ).set_index("trade_date")
+
+    latest_ivix = cal_day_ivix(latest_trade_date, all_options, bundle.shibor)
+
+    output_file = Path(output_path)
+    if output_file.exists():
+        history = pd.read_csv(output_file)
+    else:
+        history = pd.DataFrame(columns=["DateTime", "value"])
+
+    if "DateTime" not in history.columns:
+        history["DateTime"] = ""
+    if "value" not in history.columns:
+        history["value"] = np.nan
+
+    history = history[history["DateTime"] != latest_trade_date]
+    history = pd.concat(
+        [history, pd.DataFrame([{"DateTime": latest_trade_date, "value": latest_ivix}])],
+        ignore_index=True,
+    )
+    history.to_csv(output_path, index=False)
+    return latest_trade_date, latest_ivix
+
+
+if __name__ == "__main__":
+    date_text, ivix_value = refresh_latest_ivix()
+    print(f"latest ivix({date_text})={ivix_value:.4f}")

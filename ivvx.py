@@ -132,8 +132,8 @@ def cal_sigma_square(options: pd.DataFrame, risk_free_rate: float, time_to_expir
     put_all = options[options.EXE_MODE == CHINESE_PUT].set_index("EXE_PRICE").sort_index()
 
     columns_to_drop = ["SEC_NAME", "EXE_ENDDATE", "EXE_MODE"]
-    call_all = call_all.drop(columns=columns_to_drop, axis=1, inplace=False)
-    put_all = put_all.drop(columns=columns_to_drop, axis=1, inplace=False)
+    call_all = call_all.drop(columns=columns_to_drop)
+    put_all = put_all.drop(columns=columns_to_drop)
 
     call_all = call_all.groupby(level=0).agg({"CLOSE": "min"})
     put_all = put_all.groupby(level=0).agg({"CLOSE": "max"})
